@@ -1,119 +1,124 @@
 import express from 'express';
-                    import puppeteer from 'puppeteer';
-                    import * as cheerio from 'cheerio';
-                    import dotenv from 'dotenv';
+import puppeteer from 'puppeteer';
+import * as cheerio from 'cheerio';
+import dotenv from 'dotenv';
 
-                    dotenv.config();
+dotenv.config();
 
-                    const app = express();
-                    const PORT = 3000;
+const app = express();
+const PORT = 3000;
 
-                    const AUTH_HEADER = process.env.AUTH_HEADER;
+const AUTH_HEADER = process.env.AUTH_HEADER;
 
-                    if (!AUTH_HEADER) {
-                        throw new Error('Authorization header is not set in the environment variables.');
+if (!AUTH_HEADER) {
+    throw new Error('Authorization header is not set in the environment variables.');
+}
+
+app.use(express.json());
+
+app.post('/search', async (req, res) => {
+    const body = req.body || {};
+    console.log('Request body:', body);
+
+    if (!body.top || !body.bottom) {
+        console.error('Missing "top" or "bottom" in request body.');
+        return res.status(400).json({error: 'Missing "top" or "bottom" in request body.'});
+    }
+    const queries = [body.top, body.bottom];
+    console.log('Queries:', queries);
+
+    try {
+        console.log('Starting to process queries...');
+        const results = await Promise.all(queries.map(async (query) => {
+            try {
+                console.log(`Launching browser for query: ${query}`);
+                const browser = await puppeteer.launch({headless: true});
+                const page = await browser.newPage();
+                console.log('Browser launched and page created');
+
+                await page.setUserAgent(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
+                );
+
+                await page.setExtraHTTPHeaders({
+                    Authorization: AUTH_HEADER,
+                    'Content-Type': 'application/json',
+                });
+
+                const searchUrl = `https://api.inditex.com/searchpmpa/products?query=${query}&page=1&perPage=1&brand=zara`;
+                console.log('Navigating to search URL:', searchUrl);
+                const response = await page.goto(searchUrl, {waitUntil: 'domcontentloaded'});
+                console.log(`Search page response status for query "${query}":`, response.status());
+
+                const responseBody = await page.evaluate(() => {
+                    try {
+                        return JSON.parse(document.body.innerText);
+                    } catch (err) {
+                        console.error('Error parsing response body:', err.message);
+                        return null;
                     }
+                });
+                console.log('Raw response body text:', await page.evaluate(() => document.body.innerText));
 
-                    app.use(express.json());
+                const product = responseBody?.[0];
+                if (!product) {
+                    console.error('No product found for query:', query);
+                    throw new Error('No product found');
+                }
 
-                    app.post('/search', async (req, res) => {
-                        const body = req.body || {};
-                        console.log('Request body:', body);
+                const productLink = product?.link;
+                const productPrice = product?.offers?.price ?? product?.price ?? null;
+                const productPageLink = product?.offers?.url ?? product.link ?? null;
 
-                        if (!body.top || !body.bottom) {
-                            console.error('Missing "top" or "bottom" in request body.');
-                            return res.status(400).json({ error: 'Missing "top" or "bottom" in request body.' });
-                        }
-                        const queries = [body.top, body.bottom];
-                        console.log('Queries:', queries);
+                console.log('Product details:', {productLink, productPrice, productPageLink});
 
-                        try {
-                            const results = await Promise.all(queries.map(async (query) => {
-                                try {
-                                    console.log('Processing query:', query);
-                                    const browser = await puppeteer.launch({ headless: true });
-                                    const page = await browser.newPage();
+                if (!productLink) throw new Error('No link found');
 
-                                    await page.setUserAgent(
-                                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
-                                    );
+                await page.goto(productLink, {waitUntil: 'domcontentloaded'});
 
-                                    await page.setExtraHTTPHeaders({
-                                        Authorization: AUTH_HEADER,
-                                        'Content-Type': 'application/json',
-                                    });
+                const pageContent = await page.content();
+                const $ = cheerio.load(pageContent);
+                const imageLis = $('ul.product-detail-view__extra-images li');
+                console.log('Image list elements:', imageLis.length);
 
-                                    const searchUrl = `https://api.inditex.com/searchpmpa/products?query=${query}&page=1&perPage=1&brand=zara`;
-                                    console.log('Navigating to search URL:', searchUrl);
-                                    await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+                const lastThreeImages = imageLis.slice(-3).map((_, el) => {
+                    const srcset = $(el).find('source').attr('srcset');
+                    return srcset?.split(' ')[0] || null;
+                }).get();
+                console.log('Last three images:', lastThreeImages);
 
-                                    const responseBody = await page.evaluate(() => {
-                                        try {
-                                            return JSON.parse(document.body.innerText);
-                                        } catch (err) {
-                                            console.error('Error parsing response body:', err.message);
-                                            return null;
-                                        }
-                                    });
-                                    console.log('Response body:', responseBody);
+                await browser.close();
 
-                                    const product = responseBody?.[0];
-                                    if (!product) {
-                                        console.error('No product found for query:', query);
-                                        throw new Error('No product found');
-                                    }
+                return {
+                    name: product.name,
+                    images: lastThreeImages,
+                    price: productPrice?.value?.current ?? productPrice ?? null,
+                    link: productPageLink,
+                };
+            } catch (err) {
+                console.error('Caught error before throwing:', err.message);
+                console.error('Error processing query:', query, err.message);
+                return {
+                    name: null,
+                    image: null,
+                    error: err.message,
+                };
+            }
+        }));
 
-                                    const productLink = product?.link;
-                                    const productPrice = product?.offers?.price ?? product?.price ?? null;
-                                    const productPageLink = product?.offers?.url ?? product.link ?? null;
+        console.log('Results:', results);
 
-                                    console.log('Product details:', { productLink, productPrice, productPageLink });
+        res.status(200).json({
+            top: results[0],
+            bottom: results[1],
+        });
+    } catch (err) {
+        console.error('Internal Server Error:', err.message);
+        console.error('Full error stack:', err.stack);
+        res.status(500).json({error: 'Internal Server Error', details: err.message});
+    }
+});
 
-                                    if (!productLink) throw new Error('No link found');
-
-                                    await page.goto(productLink, { waitUntil: 'domcontentloaded' });
-
-                                    const pageContent = await page.content();
-                                    const $ = cheerio.load(pageContent);
-                                    const imageLis = $('ul.product-detail-view__extra-images li');
-                                    console.log('Image list elements:', imageLis.length);
-
-                                    const lastThreeImages = imageLis.slice(-3).map((_, el) => {
-                                        const srcset = $(el).find('source').attr('srcset');
-                                        return srcset?.split(' ')[0] || null;
-                                    }).get();
-                                    console.log('Last three images:', lastThreeImages);
-
-                                    await browser.close();
-
-                                    return {
-                                        name: product.name,
-                                        images: lastThreeImages,
-                                        price: productPrice?.value?.current ?? productPrice ?? null,
-                                        link: productPageLink,
-                                    };
-                                } catch (err) {
-                                    console.error('Error processing query:', query, err.message);
-                                    return {
-                                        name: null,
-                                        image: null,
-                                        error: err.message,
-                                    };
-                                }
-                            }));
-
-                            console.log('Results:', results);
-
-                            res.status(200).json({
-                                top: results[0],
-                                bottom: results[1],
-                            });
-                        } catch (err) {
-                            console.error('Internal Server Error:', err.message);
-                            res.status(500).json({ error: 'Internal Server Error', details: err.message });
-                        }
-                    });
-
-                    app.listen(PORT, () => {
-                        console.log(`Server is running on http://localhost:${PORT}`);
-                    });
+app.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
+});
