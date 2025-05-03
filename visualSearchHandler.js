@@ -1,4 +1,5 @@
 import puppeteer from "puppeteer";
+import * as cheerio from 'cheerio';
 
 export const handleVisualSearch = async (req, res, AUTH_HEADER) => {
     const body = req.body || {};
@@ -23,10 +24,14 @@ export const handleVisualSearch = async (req, res, AUTH_HEADER) => {
             'Content-Type': 'application/json',
         });
 
-        const searchUrl = `https://api.inditex.com/pubvsearch/products?image=${body.url}`;
+        // URL-encode the image URL to ensure query is interpreted correctly
+        const encodedImageUrl = encodeURIComponent(body.url);
+        const searchUrl = `https://api.inditex.com/pubvsearch/products?image=${encodedImageUrl}`;
 
         console.log('Navigating to search URL:', searchUrl);
         const response = await page.goto(searchUrl, {waitUntil: 'domcontentloaded'});
+
+        console.log('Search response status:', response.status());
 
         const responseBody = await page.evaluate(() => {
             try {
@@ -37,42 +42,71 @@ export const handleVisualSearch = async (req, res, AUTH_HEADER) => {
             }
         });
 
-        console.log('Raw response body text:', await page.evaluate(() => document.body.innerText));
-
-        const product = responseBody?.[0];
-
-        if (!product || !product.link) {
-            await browser.close();
-            return res.status(500).json({ error: 'Product or link not found in response.' });
+        if (!Array.isArray(responseBody) || responseBody.length === 0) {
+            console.warn('Visual search returned no results. Check URL encoding or token validity.');
         }
 
-        // Navigate to the product page
-        console.log('Navigating to product page:', product.link);
-        await page.goto(product.link, { waitUntil: 'domcontentloaded' });
+        console.log('Raw response body text:', await page.evaluate(() => document.body.innerText));
 
-        // Scrape last three image URLs based on the correct HTML structure
-        const lastThreeImages = await page.evaluate(() => {
-            const wrappers = Array.from(document.querySelectorAll('ul.product-detail-view__extra-images li'));
-            const urls = wrappers.map(wrapper => {
-                const source = wrapper.querySelector('picture source');
-                const srcset = source?.getAttribute('srcset') || '';
-                const entries = srcset.split(',');
-                // Prefer 1118px width if available, otherwise take highest
-                const preferred = entries.find(e => e.includes('w=1118')) || entries[entries.length - 1];
-                return preferred.trim().split(' ')[0];
-            }).filter(Boolean);
-            return urls.slice(-3);
-        });
+        const topTwo = responseBody.slice(0, 2);
+
+        const details = await Promise.all(topTwo.map(async (product) => {
+            console.log('Navigating to product page:', product.link);
+
+            const productPage = await browser.newPage();
+            await productPage.setUserAgent(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36'
+            );
+
+            try {
+                // Wait for full network idle so all lazy images load
+                await productPage.goto(product.link, { waitUntil: ['domcontentloaded','networkidle2'], timeout: 30000 });
+            } catch (err) {
+                console.warn('Navigation aborted but proceeding:', err.message);
+            }
+            // Scroll to bottom to trigger lazy-load
+            await productPage.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
+            // Pause briefly to allow lazy-loaded images to populate
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            let images = [];
+            try {
+                // Wait for any <source> tags in the extra-images carousel
+                await productPage.waitForSelector('ul.product-detail-view__extra-images li picture source', { timeout: 8000 });
+
+                images = await productPage.$$eval(
+                    'ul.product-detail-view__extra-images li picture source',
+                    (sources) => {
+                        const urls = sources
+                            .map((source) => {
+                                // The srcset attribute contains "URL w" entries; take the first URL
+                                const srcset = source.getAttribute('srcset') || '';
+                                const first = srcset.split(',')[0].trim().split(' ')[0];
+                                return first;
+                            })
+                            .filter((url) => url && !url.includes('transparent-background'));
+                        // Return the last three URLs
+                        return urls.slice(-3);
+                    }
+                );
+            } catch (err) {
+                console.warn('Could not extract images:', err.message);
+            }
+
+            await productPage.close();
+
+            return {
+                name: product.name,
+                price: product.price?.value?.current ?? null,
+                currency: product.price?.currency ?? null,
+                link: product.link,
+                images,
+            };
+        }));
 
         await browser.close();
 
-        res.status(200).json({
-            name: product.name,
-            price: product.price?.value?.current,
-            currency: product.price?.currency,
-            link: product.link,
-            images: lastThreeImages,
-        });
+        res.status(200).json(details);
     } catch (err) {
         console.error('Caught error before throwing:', err.message);
         return {
